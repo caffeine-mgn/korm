@@ -62,6 +62,16 @@ class EntityDescription(
         /** Вложенное описание, если поле `@Embedded`. */
         val embedded: EntityDescription?,
         /**
+         * Путь к полю в объекте, через точку: `address.city`.
+         *
+         * Нужен для сопоставления со значениями из `ValueEncoder`, который
+         * ключует именно так. **Не то же самое, что [embeddedPrefix]**:
+         * префикс — это имя колонки в БД (`home_`), а путь — имя поля в
+         * классе (`address`). Совпадают они только если `@EmbeddedPrefix`
+         * не задан.
+         */
+        val objectPath: String,
+        /**
          * Вид значения по `SerialKind` — нужен для вывода типа колонки,
          * когда `@ColumnType` не задан.
          */
@@ -114,7 +124,7 @@ class EntityDescription(
             val name = tableNameOverride ?: tableAnn?.tableName ?: d.serialName.substringAfterLast('.')
 
             val cols = mutableListOf<Column>()
-            collectColumns(d, engine, prefix, cols)
+            collectColumns(d, engine, prefix, null, cols)
 
             val ids = cols.filter { it.isId }
 
@@ -156,6 +166,7 @@ class EntityDescription(
             d: SerialDescriptor,
             engine: DatabaseEngine,
             prefix: String?,
+            objectPath: String?,
             out: MutableList<Column>,
         ) {
             for (i in 0 until d.elementsCount) {
@@ -166,7 +177,11 @@ class EntityDescription(
                 val embedded = anns.any { it is Embedded }
                 if (embedded && el.kind == StructureKind.CLASS) {
                     val embPrefix = anns.filterIsInstance<EmbeddedPrefix>().firstOrNull()?.prefix ?: prefix
-                    collectColumns(el, engine, embPrefix, out)
+                    // Путь в объекте дополняется именем поля, префикс колонки —
+                    // из аннотации. Это разные вещи, и путать их значит
+                    // потерять значения при записи.
+                    val newPath = if (objectPath == null) elName else "$objectPath.$elName"
+                    collectColumns(el, engine, embPrefix, newPath, out)
                     continue
                 }
 
@@ -188,6 +203,7 @@ class EntityDescription(
                     embeddedPrefix = prefix,
                     embedded = if (embedded) of(el, engine, null, prefix) else null,
                     kind = el.kind,
+                    objectPath = if (objectPath == null) elName else "$objectPath.$elName",
                 )
             }
         }

@@ -1,32 +1,29 @@
 package pw.binom.db.orm
 
-import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
-import kotlinx.serialization.SerializationException
 import kotlinx.serialization.descriptors.SerialDescriptor
-import kotlinx.serialization.descriptors.StructureKind
-import kotlinx.serialization.encoding.CompositeDecoder
-import kotlinx.serialization.encoding.Decoder
-import kotlinx.serialization.modules.EmptySerializersModule
-import kotlinx.serialization.modules.SerializersModule
-import kotlinx.serialization.serializer
 import pw.binom.db.Connection
-import pw.binom.db.pool.ConnectionPool
 import pw.binom.db.DatabaseEngine
 import pw.binom.db.ResultSet
 import pw.binom.db.SqlValue
-import pw.binom.db.pool.PooledConnection
+import pw.binom.db.pool.ConnectionPool
 import pw.binom.db.transaction
 
 /**
  * Доступ к БД через ORM.
  *
- * ## Как устроено
+ * ## Привязанное соединение
  *
- * Соединение берётся из пула на всё время блока [transaction]/[read] —
- * поэтому транзакция охватывает все запросы внутри, а не только один.
- * Это и есть причина, по которой пул отдаёт `withConnection`, а не пару
- * `borrow`/`free`.
+ * Внутри [transaction]/[read] методы работают с уже выданным соединением, а
+ * не берут новое из пула. Это не оптимизация, а условие работоспособности:
+ * без него `transaction { orm -> orm.findAll() }` занимает одно соединение
+ * снаружи и просит второе внутри — при `maxConnections = 1` это вечный
+ * deadlock, а при большем потолке — просто разбазаривание соединений.
+ *
+ * Реализовано двумя экземплярами: обычный [Orm] смотрит в пул, а тот, что
+ * приходит в блок, держит [bound] и в пул не обращается. Никаких
+ * `ThreadLocal` и переменных в корутинном контексте: соединение
+ * передаётся явно, и его видно в типе.
  *
  * ## Почему KSerializer, а не рефлексия
  *
@@ -37,25 +34,45 @@ import pw.binom.db.transaction
  * ## Что НЕ поддерживается
  *
  * Связи (`@OneToMany` и подобное) — нет. ORM плоская: одна сущность — одна
- * таблица. Для связей пишите JOIN руками через [select] с готовым SQL.
- * Это осознанно: полноценный ORM-слой с ленивой загрузкой тянет за собой
- * сессии, кэш первого уровня и unit of work, а нужен он не всегда.
+ * таблица. Для JOIN пишите SQL руками через [select].
  */
-class Orm(
-    private val pool: ConnectionPool,
-    engine: DatabaseEngine,
-    serializersModule: SerializersModule = EmptySerializersModule(),
+class Orm private constructor(
+    /** Пул. `null`, если соединение привязано. */
+    private val pool: ConnectionPool?,
+    /** Привязанное соединение. `null`, если работаем через пул. */
+    private val bound: Connection?,
+    private val engine: DatabaseEngine,
 ) {
+    /**
+     * Основной конструктор: ORM поверх пула.
+     *
+     * Пул не `null` здесь и не `null` в [bound] — ровно одно из двух, и
+     * private-конструктор гарантирует, что другого не будет.
+     */
+    constructor(pool: ConnectionPool, engine: DatabaseEngine) : this(pool, null, engine)
+
     private val dialect = SqlBuilder.Dialect(
         engine = engine,
         supportsReturning = engine == DatabaseEngine.POSTGRESQL,
     )
     private val sql = SqlBuilder(dialect)
-    private val module = serializersModule
-    private val engine = engine
 
     /** Кэш описаний: разбор дескриптора небыстрый, а нужен на каждый запрос. */
     private val cache = mutableMapOf<String, EntityDescription>()
+
+    /**
+     * Выполняет блок с соединением: привязанным или из пула.
+     *
+     * Единственное место, где решается этот выбор. Все методы ниже идут
+     * через него, поэтому вложенный вызов внутри транзакции всегда попадает
+     * в то же соединение.
+     */
+    private suspend fun <R> withConn(block: suspend (Connection) -> R): R {
+        val b = bound
+        if (b != null) return block(b)
+        val p = pool ?: error("ни пул, ни соединение не заданы")
+        return p.withConnection(block)
+    }
 
     // ------------------------------------------------------------- схема
 
@@ -66,7 +83,7 @@ class Orm(
      * при старте приложения — норма.
      */
     suspend fun createSchema(vararg serializers: KSerializer<*>) {
-        pool.withConnection { conn ->
+        withConn { conn ->
             for (s in serializers) {
                 val e = description(s)
                 conn.executeUpdate(sql.createTable(e))
@@ -80,37 +97,44 @@ class Orm(
     // ------------------------------------------------------------- чтение
 
     /** Читает все строки таблицы. */
-    suspend fun <T : Any> findAll(serializer: KSerializer<T>): List<T> =
-        pool.withConnection { conn -> readAll(conn, serializer) }
+    suspend fun <T : Any> findAll(serializer: KSerializer<T>): List<T> = withConn { conn ->
+        val e = description(serializer)
+        val rs = conn.query(sql.select(e))
+        val out = mutableListOf<T>()
+        while (rs.next()) out += decode(rs, serializer, e)
+        out
+    }
 
     /** Читает по первичному ключу. `null`, если строки нет. */
-    suspend fun <T : Any> findById(serializer: KSerializer<T>, id: Any?): T? =
-        pool.withConnection { conn ->
-            val e = description(serializer)
-            require(e.idColumns.isNotEmpty()) { "у ${e.tableName} нет @Id" }
-            val idCol = e.idColumns.first()
-            val query = "${sql.selectById(e).replace(Regex(":${idCol.propertyName}"), "")} ${whereId(e)}"
-            val stmt = conn.prepare(sql.selectById(e))
-            stmt.use {
-                val rs = it.query(sqlValueOf(id))
-                if (!rs.next()) return@withConnection null
-                decode(rs, serializer, e)
-            }
+    suspend fun <T : Any> findById(serializer: KSerializer<T>, id: Any?): T? = withConn { conn ->
+        val e = description(serializer)
+        require(e.idColumns.isNotEmpty()) { "у ${e.tableName} нет @Id" }
+        val stmt = conn.prepare(sql.selectById(e))
+        stmt.use {
+            val rs = it.query(listOf(sqlValueOf(id)))
+            if (!rs.next()) return@withConn null
+            decode(rs, serializer, e)
         }
+    }
 
-    /** Произвольный SELECT с ручным SQL. Параметры — `:name` в [args]. */
+    /**
+     * Произвольный SELECT.
+     *
+     * Параметры — `:name` в тексте и пары `"name" to значение`. Порядок пар
+     * задаёт порядок позиций: конвертер драйвера переставит их сам, если
+     * имя встречается в запросе несколько раз.
+     */
     suspend fun <T : Any> select(
         sqlText: String,
         serializer: KSerializer<T>,
         vararg args: Pair<String, Any?>,
-    ): List<T> = pool.withConnection { conn ->
-        val stmt = conn.prepare(bindNamed(sqlText, args))
+    ): List<T> = withConn { conn ->
+        val stmt = conn.prepare(sqlText)
         stmt.use { prepared ->
-            val rs = prepared.query(preparedOrder(args))
+            val rs = prepared.query(args.map { sqlValueOf(it.second) })
+            val e = description(serializer)
             val out = mutableListOf<T>()
-            while (rs.next()) {
-                out += decode(rs, serializer, description(serializer))
-            }
+            while (rs.next()) out += decode(rs, serializer, e)
             out
         }
     }
@@ -119,44 +143,74 @@ class Orm(
 
     /** Вставляет объект. Сгенерированные колонки не передаются. */
     suspend fun <T : Any> insert(serializer: KSerializer<T>, value: T) {
-        pool.withConnection { conn ->
+        withConn { conn ->
             val e = description(serializer)
             val stmt = conn.prepare(sql.insert(e))
-            stmt.use {
-                it.update(valuesOf(e, value, serializer, includeGenerated = false))
-            }
+            stmt.use { it.update(valuesOf(e, value, serializer, e.insertColumns)) }
         }
     }
 
     /** Обновляет по первичному ключу. */
     suspend fun <T : Any> update(serializer: KSerializer<T>, value: T) {
-        pool.withConnection { conn ->
+        withConn { conn ->
             val e = description(serializer)
             val stmt = conn.prepare(sql.update(e))
             stmt.use {
                 // Порядок: сначала SET-колонки, потом ключи в WHERE.
-                val sets = valuesOf(e, value, serializer, includeGenerated = false, only = e.updateColumns)
+                val sets = valuesOf(e, value, serializer, e.updateColumns)
                 val ids = e.idColumns.map { col -> valueOf(value, serializer, col) }
                 it.update(sets + ids)
             }
         }
     }
 
-    /** Upsert по первичному ключу. Требует `@Id`. */
+    /**
+     * Вставляет или обновляет по первичному ключу.
+     *
+     * Колонка ключа передаётся **всегда**, даже если она `@AutoGenerated`:
+     * без неё `INSERT` не даст конфликта, `ON CONFLICT` не сработает, и
+     * вместо обновления появится новая строка с новым ключом. Значение `0`
+     * трактуется как «новый объект» — см. [upsertAuto].
+     */
     suspend fun <T : Any> upsert(serializer: KSerializer<T>, value: T) {
-        require(engine != DatabaseEngine.SQLITE || true) { "" }
-        pool.withConnection { conn ->
+        withConn { conn ->
             val e = description(serializer)
-            val stmt = conn.prepare(sql.upsert(e))
-            stmt.use {
-                it.update(valuesOf(e, value, serializer, includeGenerated = false))
-            }
+            // Набор колонок в SQL и набор значений обязаны совпадать:
+            // расхождение сдвигает параметры и даёт неверный тип.
+            val cols = upsertColumns(e)
+            val stmt = conn.prepare(sql.upsert(e, insertColumns = cols))
+            stmt.use { it.update(valuesOf(e, value, serializer, cols)) }
         }
+    }
+
+    /**
+     * Upsert для сущности с авто-ключом.
+     *
+     * Если ключ не задан (`0` или `null`), выполняется обычный `insert`:
+     * иначе `ON CONFLICT (id = 0)` создал бы строку с нулевым ключом.
+     * Возвращает `true`, если строка была вставлена.
+     */
+    suspend fun <T : Any> upsertAuto(serializer: KSerializer<T>, value: T): Boolean {
+        val e = description(serializer)
+        val idCol = e.idColumns.firstOrNull() ?: error("upsertAuto требует @Id у ${e.tableName}")
+        val idValue = valueOf(value, serializer, idCol)
+        val isNew = when (idValue) {
+            SqlValue.Null -> true
+            is SqlValue.Int64 -> idValue.value == 0L
+            is SqlValue.Int32 -> idValue.value == 0
+            else -> false
+        }
+        if (isNew) {
+            insert(serializer, value)
+            return true
+        }
+        upsert(serializer, value)
+        return false
     }
 
     /** Удаляет по первичному ключу. */
     suspend fun <T : Any> deleteById(serializer: KSerializer<T>, id: Any?) {
-        pool.withConnection { conn ->
+        withConn { conn ->
             val e = description(serializer)
             val stmt = conn.prepare(sql.deleteById(e))
             stmt.use { it.update(listOf(sqlValueOf(id))) }
@@ -165,89 +219,79 @@ class Orm(
 
     /** Удаляет все строки таблицы. */
     suspend fun <T : Any> deleteAll(serializer: KSerializer<T>) {
-        pool.withConnection { conn ->
+        withConn { conn ->
             conn.executeUpdate(sql.deleteAll(description(serializer)))
         }
     }
 
     // ------------------------------------------------------------- транзакции
 
-    /** Блок в транзакции: соединение занято на всё время. */
+    /**
+     * Блок в транзакции.
+     *
+     * В блок приходит `Orm` с привязанным соединением: все запросы внутри
+     * идут в ту же транзакцию. Соединение освобождается в конце.
+     */
     suspend fun <R> transaction(block: suspend (Orm) -> R): R =
-        pool.withConnection { conn ->
-            conn.transaction { block(this) }
+        withConn { conn ->
+            conn.transaction { block(Orm(null, conn, engine)) }
         }
 
-    /** Блок без транзакции: соединение занято, но каждый запрос сам по себе. */
+    /**
+     * Блок без транзакции, но с одним соединением на всё время.
+     *
+     * Нужен, когда запросов несколько и важна их последовательность в одном
+     * соединении (например, `createSchema` плюс проверка), но атомарность не
+     * требуется.
+     */
     suspend fun <R> read(block: suspend (Orm) -> R): R =
-        pool.withConnection { block(this) }
+        withConn { conn -> block(Orm(null, conn, engine)) }
 
     // ------------------------------------------------------------- внутреннее
 
     private fun description(serializer: KSerializer<*>): EntityDescription {
         val key = "${engine}:${serializer.descriptor.serialName}"
-        return cache.getOrPut(key) {
-            EntityDescription.of(serializer, engine)
-        }
+        return cache.getOrPut(key) { EntityDescription.of(serializer.descriptor, engine) }
     }
-
-    private suspend fun <T : Any> readAll(conn: Connection, serializer: KSerializer<T>): List<T> {
-        val e = description(serializer)
-        val rs = conn.query(sql.select(e))
-        val out = mutableListOf<T>()
-        while (rs.next()) out += decode(rs, serializer, e)
-        return out
-    }
-
-    private fun whereId(e: EntityDescription): String =
-        e.idColumns.joinToString(" AND ") { "${it.fullColumnName} = :${it.propertyName}" }
 
     /**
-     * Читает строку в объект через `CompositeDecoder`.
+     * Колонки для `upsert`.
      *
-     * `decodeSerializableValue` требует `Decoder`, поэтому используется
-     * `ResultSetDecoder` — он отдаёт значения в порядке элементов
-     * дескриптора. Колонки сопоставляются по `fullColumnName` из описания,
-     * а не по позиции в результате: порядок `SELECT` может отличаться.
+     * Отличие от `insertColumns` только в ключе: `@AutoGenerated` ключ
+     * обязан присутствовать, иначе конфликта не будет.
      */
-    @OptIn(ExperimentalSerializationApi::class)
-    private fun <T : Any> decode(rs: ResultSet, serializer: KSerializer<T>, e: EntityDescription): T {
-        val decoder = ResultSetDecoder(rs, e, serializer.descriptor)
-        return decoder.decodeSerializableValue(serializer)
-    }
+    private fun upsertColumns(e: EntityDescription): List<EntityDescription.Column> =
+        e.columns.filter { it.isId || !it.autoGenerated }
+
+    /** Читает строку в объект через [ResultSetDecoder]. */
+    private fun <T : Any> decode(rs: ResultSet, serializer: KSerializer<T>, e: EntityDescription): T =
+        ResultSetDecoder(rs, e, serializer.descriptor).decodeSerializableValue(serializer)
 
     /**
-     * Значения колонок из объекта.
+     * Значения указанных колонок из объекта.
      *
-     * Читаются через [ValueEncoder] — он обходит дескриптор и складывает
-     * значения по индексам элементов, разворачивая `@Embedded`.
+     * [ValueEncoder] отдаёт карту по путям (`addr.city`), а колонки описаны
+     * с префиксом из `@EmbeddedPrefix`. Ключи не совпадают намеренно:
+     * префикс в БД и имя поля в объекте — разные вещи, и склеивать их здесь
+     * значило бы требовать совпадения.
      */
     private fun <T : Any> valuesOf(
         e: EntityDescription,
         value: T,
         serializer: KSerializer<T>,
-        includeGenerated: Boolean,
-        only: List<EntityDescription.Column>? = null,
+        cols: List<EntityDescription.Column>,
     ): List<SqlValue> {
         val map = ValueEncoder.encode(value, serializer)
-        val cols = only ?: if (includeGenerated) e.columns else e.insertColumns
-        return cols.map { col ->
-            val key = if (col.embeddedPrefix != null) "${col.embeddedPrefix}.${col.propertyName}" else col.propertyName
-            map[key] ?: map[col.propertyName] ?: SqlValue.Null
-        }
+        // Ключ — [EntityDescription.Column.objectPath]: `address.city`. Это
+        // путь в объекте, а не имя колонки: `@EmbeddedPrefix("home_")` даёт
+        // колонку `home_city`, но поле в классе остаётся `address.city`.
+        return cols.map { col -> map[col.objectPath] ?: SqlValue.Null }
     }
 
     private fun <T : Any> valueOf(value: T, serializer: KSerializer<T>, col: EntityDescription.Column): SqlValue {
         val map = ValueEncoder.encode(value, serializer)
-        val key = if (col.embeddedPrefix != null) "${col.embeddedPrefix}.${col.propertyName}" else col.propertyName
-        return map[key] ?: map[col.propertyName] ?: SqlValue.Null
+        return map[col.objectPath] ?: SqlValue.Null
     }
-
-    /** `:name` в SQL + список значений в порядке появления имён. */
-    private fun bindNamed(sqlText: String, args: Array<out Pair<String, Any?>>): String = sqlText
-
-    private fun preparedOrder(args: Array<out Pair<String, Any?>>): List<SqlValue> =
-        args.map { sqlValueOf(it.second) }
 
     private fun sqlValueOf(v: Any?): SqlValue = SqlValue.of(v) ?: SqlValue.Null
 }

@@ -43,7 +43,16 @@ internal class ResultSetDecoder(
      */
     private val rootDescriptor: SerialDescriptor = root
 
-    private var index: Int = -1
+    /**
+     * Стек счётчиков элементов.
+     *
+     * Один общий счётчик здесь не работает: при входе во вложенный объект
+     * внешний счётчик уже указывает за пределы его дескриптора, и
+     * `decodeElementIndex` сразу вернул бы `DECODE_DONE` — вложенные поля
+     * остались бы незаполненными (`MissingFieldException` на первом же
+     * `@Embedded`). Поэтому у каждой структуры в стеке свой счётчик.
+     */
+    private val indexStack = ArrayDeque<Int>().apply { addLast(-1) }
 
     /** Стек имён для `@Embedded`, как в [ValueEncoder]. */
     private val path = ArrayDeque<String>()
@@ -51,12 +60,17 @@ internal class ResultSetDecoder(
     private var pendingName: String? = null
 
     override fun decodeElementIndex(descriptor: SerialDescriptor): Int {
-        index++
-        if (index >= descriptor.elementsCount) return CompositeDecoder.DECODE_DONE
+        val next = indexStack.last() + 1
+        indexStack.removeLast()
+        if (next >= descriptor.elementsCount) {
+            indexStack.addLast(next)
+            return CompositeDecoder.DECODE_DONE
+        }
+        indexStack.addLast(next)
         // Имя запоминаем сразу: следующий вызов будет либо scalar-decode,
         // либо beginStructure для вложенного объекта.
-        pendingName = descriptor.getElementName(index)
-        return index
+        pendingName = descriptor.getElementName(next)
+        return next
     }
 
     /**
@@ -67,10 +81,13 @@ internal class ResultSetDecoder(
         val here = pendingName
         pendingName = null
         if (here != null) path.addLast(here)
+        // Новая структура — свой счётчик.
+        indexStack.addLast(-1)
         return this
     }
 
     override fun endStructure(descriptor: SerialDescriptor) {
+        if (indexStack.size > 1) indexStack.removeLast()
         if (path.isNotEmpty()) path.removeLast()
         pendingName = null
     }
@@ -98,16 +115,23 @@ internal class ResultSetDecoder(
     }
 
     /** Имя колонки текущего элемента, вычисляемое по индексу и пути. */
-    private fun currentColumn(): String? {
+    /**
+     * Описание колонки для текущего элемента.
+     *
+     * Ищется по [EntityDescription.Column.objectPath] — пути в объекте
+     * (`address.city`), а не по имени колонки в БД: у `@EmbeddedPrefix`
+     * они расходятся.
+     */
+    private fun currentColumn(): EntityDescription.Column? {
         val name = pendingName ?: return null
-        return if (path.isEmpty()) name else path.joinToString(".") + "." + name
+        val full = if (path.isEmpty()) name else path.joinToString(".") + "." + name
+        return entity.columns.firstOrNull { it.objectPath == full }
+            ?: entity.columns.firstOrNull { it.propertyName == full }
+            ?: entity.columns.firstOrNull { it.fullColumnName == full }
     }
 
     private fun columnIndex(): Int? {
-        val full = currentColumn() ?: return null
-        val col = entity.columns.firstOrNull { it.propertyName == full }
-            ?: entity.columns.firstOrNull { it.fullColumnName == full }
-            ?: return null
+        val col = currentColumn() ?: return null
         return runCatching { rs.columnIndex(col.fullColumnName) }.getOrNull()
     }
 
