@@ -1,0 +1,192 @@
+package pw.binom.db.orm
+
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.SerialKind
+import kotlinx.serialization.descriptors.StructureKind
+import pw.binom.db.DatabaseEngine
+
+/**
+ * Генератор SQL по [EntityDescription].
+ *
+ * ## Почему именованные параметры
+ *
+ * Генерируется `:name`, а не `$1` или `?`: ORM не должна знать, какая СУБД
+ * под ней. Перевод в позиционный вид — работа драйвера (в `kpostgres`
+ * адаптере это `ParamConverter`). Так одна генерация годится для всех.
+ *
+ * ## Почему `quote` отдельно
+ *
+ * В Postgres незакавыченный идентификатор приводится к нижнему регистру, в
+ * SQLite сохраняется как написан. Генератор не решает за СУБД: он берёт
+ * кавычки из `@UseQuotes` и из настроек конкретной БД, которые приходят в
+ * [Dialect].
+ */
+class SqlBuilder(private val dialect: Dialect) {
+
+    /** Как экранировать идентификаторы в целевой БД. */
+    class Dialect(
+        val engine: DatabaseEngine,
+        /** Начало кавычки: `"` для Postgres/SQLite. */
+        val quoteStart: String = "\"",
+        /** Конец кавычки. */
+        val quoteEnd: String = "\"",
+        /**
+         * Возвращает ли `INSERT` вставленную строку.
+         *
+         * Postgres — да (`RETURNING`), SQLite — только через
+         * `RETURNING`, который есть с 3.35, но `ksqlite` может быть
+         * собран со старой версией. По умолчанию не полагаемся.
+         */
+        val supportsReturning: Boolean = false,
+    )
+
+    private fun ident(name: String, quoted: Boolean): String =
+        if (quoted) "${dialect.quoteStart}$name${dialect.quoteEnd}" else name
+
+    private fun table(e: EntityDescription): String = ident(e.tableName, e.tableQuoted)
+
+    /** `INSERT INTO t (a, b) VALUES (:a, :b)`. Сгенерированные колонки пропускаются. */
+    fun insert(e: EntityDescription): String {
+        val cols = e.insertColumns
+        require(cols.isNotEmpty()) { "у ${e.tableName} нет колонок для вставки" }
+        val names = cols.joinToString(", ") { ident(it.fullColumnName, it.quoted) }
+        val params = cols.joinToString(", ") { ":${it.propertyName}" }
+        return "INSERT INTO ${table(e)} ($names) VALUES ($params)"
+    }
+
+    /**
+     * `INSERT ... ON CONFLICT (id) DO UPDATE SET ...`.
+     *
+     * Conflict target — колонки первичного ключа. Без `@Id` upsert
+     * невозможен: непонятно, по чему искать совпадение, и молча
+     * превращаться в обычный INSERT было бы неверно.
+     */
+    fun upsert(e: EntityDescription, updateColumns: List<EntityDescription.Column> = e.updateColumns): String {
+        require(e.idColumns.isNotEmpty()) { "upsert требует @Id у ${e.tableName}" }
+        val base = insert(e)
+        val conflict = e.idColumns.joinToString(", ") { ident(it.fullColumnName, it.quoted) }
+        if (updateColumns.isEmpty()) return "$base ON CONFLICT ($conflict) DO NOTHING"
+
+        val sets = updateColumns.joinToString(", ") { c ->
+            "${ident(c.fullColumnName, c.quoted)} = excluded.${ident(c.fullColumnName, c.quoted)}"
+        }
+        return "$base ON CONFLICT ($conflict) DO UPDATE SET $sets"
+    }
+
+    /** `SELECT a, b FROM t`. Без `WHERE` — вызывающий добавляет условие сам. */
+    fun select(e: EntityDescription, columns: List<EntityDescription.Column> = e.columns): String {
+        require(columns.isNotEmpty()) { "нечего выбирать из ${e.tableName}" }
+        val names = columns.joinToString(", ") { ident(it.fullColumnName, it.quoted) }
+        return "SELECT $names FROM ${table(e)}"
+    }
+
+    /** `SELECT ... WHERE id = :id` по первичному ключу. */
+    fun selectById(e: EntityDescription): String {
+        require(e.idColumns.isNotEmpty()) { "selectById требует @Id у ${e.tableName}" }
+        val where = e.idColumns.joinToString(" AND ") {
+            "${ident(it.fullColumnName, it.quoted)} = :${it.propertyName}"
+        }
+        return "${select(e)} WHERE $where"
+    }
+
+    /** `UPDATE t SET a = :a WHERE id = :id`. */
+    fun update(e: EntityDescription, updateColumns: List<EntityDescription.Column> = e.updateColumns): String {
+        require(e.idColumns.isNotEmpty()) { "update требует @Id у ${e.tableName}" }
+        require(updateColumns.isNotEmpty()) { "у ${e.tableName} нет колонок для обновления" }
+
+        val sets = updateColumns.joinToString(", ") { c ->
+            "${ident(c.fullColumnName, c.quoted)} = :${c.propertyName}"
+        }
+        val where = e.idColumns.joinToString(" AND ") {
+            "${ident(it.fullColumnName, it.quoted)} = :${it.propertyName}"
+        }
+        return "UPDATE ${table(e)} SET $sets WHERE $where"
+    }
+
+    /** `DELETE FROM t WHERE id = :id`. */
+    fun deleteById(e: EntityDescription): String {
+        require(e.idColumns.isNotEmpty()) { "deleteById требует @Id у ${e.tableName}" }
+        val where = e.idColumns.joinToString(" AND ") {
+            "${ident(it.fullColumnName, it.quoted)} = :${it.propertyName}"
+        }
+        return "DELETE FROM ${table(e)} WHERE $where"
+    }
+
+    /** `DELETE FROM t` — удалить всё. Опасно, но нужно для тестов и сброса. */
+    fun deleteAll(e: EntityDescription): String = "DELETE FROM ${table(e)}"
+
+    /**
+     * `CREATE TABLE`.
+     *
+     * `IF NOT EXISTS` — чтобы повторный вызов не падал: миграции в ORM нет,
+     * и создание схемы идемпотентно.
+     */
+    fun createTable(e: EntityDescription, ifNotExist: Boolean = true): String {
+        val cols = e.columns.joinToString(",\n  ") { c ->
+            buildString {
+                append(ident(c.fullColumnName, c.quoted))
+                append(' ')
+                append(c.explicitType ?: columnType(c, dialect.engine))
+                if (c.isId) {
+                    append(" PRIMARY KEY")
+                    // SQLite требует AUTOINCREMENT после PRIMARY KEY; Postgres
+                    // получает BIGSERIAL в типе и добавки не нужно.
+                    if (c.autoGenerated && dialect.engine == DatabaseEngine.SQLITE) {
+                        append(" AUTOINCREMENT")
+                    }
+                } else {
+                    append(" NOT NULL")
+                }
+            }
+        }
+        val ine = if (ifNotExist) "IF NOT EXISTS " else ""
+        return "CREATE TABLE $ine${table(e)} (\n  $cols\n)"
+    }
+
+    /** `CREATE INDEX`. */
+    fun createIndex(e: EntityDescription, ix: EntityDescription.IndexDescription): String {
+        val unique = if (ix.unique) "UNIQUE " else ""
+        val cols = ix.columns.joinToString(", ") { ident(it, false) }
+        return "CREATE ${unique}INDEX IF NOT EXISTS ${ident(ix.name, false)} ON ${table(e)} ($cols)"
+    }
+
+    /**
+     * Тип колонки по умолчанию.
+     *
+     * Порядок: `@AutoGenerated` → серийный тип; иначе по `SerialKind`.
+     * Сгенерированный ключ в Postgres — `BIGSERIAL` (он же выдаёт
+     * последовательность), в SQLite — `INTEGER` плюс `AUTOINCREMENT` в
+     * объявлении ключа.
+     */
+    private fun columnType(c: EntityDescription.Column, engine: DatabaseEngine): String {
+        if (c.autoGenerated) {
+            return when (engine) {
+                DatabaseEngine.POSTGRESQL -> if (c.kind == PrimitiveKind.INT) "SERIAL" else "BIGSERIAL"
+                DatabaseEngine.SQLITE -> "INTEGER"
+            }
+        }
+        if (c.kind == StructureKind.CLASS || c.embedded != null) return "TEXT"
+        return defaultColumnType(c.kind, engine)
+    }
+}
+
+/**
+ * Тип колонки по дескриптору типа значения.
+ *
+ * Отдельно от [SqlBuilder], потому что зависит от `SerialKind`, а не от
+ * цепочки аннотаций. Вызывается из генератора схемы, когда `@ColumnType` не
+ * задан.
+ */
+fun defaultColumnType(kind: SerialKind, engine: DatabaseEngine): String = when (kind) {
+    PrimitiveKind.STRING -> "TEXT"
+    // SQLite не имеет BOOLEAN: хранит 0/1 в INTEGER. Приводить на стороне
+    // драйвера, а не полагаться на неявное преобразование.
+    PrimitiveKind.BOOLEAN -> if (engine == DatabaseEngine.SQLITE) "INTEGER" else "BOOLEAN"
+    PrimitiveKind.BYTE -> "SMALLINT"
+    PrimitiveKind.SHORT -> "SMALLINT"
+    PrimitiveKind.INT -> "INTEGER"
+    PrimitiveKind.LONG -> "BIGINT"
+    PrimitiveKind.FLOAT -> "REAL"
+    PrimitiveKind.DOUBLE -> if (engine == DatabaseEngine.SQLITE) "REAL" else "DOUBLE PRECISION"
+    else -> "TEXT"
+}
