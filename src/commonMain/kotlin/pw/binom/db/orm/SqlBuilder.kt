@@ -4,6 +4,8 @@ import kotlinx.serialization.descriptors.PrimitiveKind
 import kotlinx.serialization.descriptors.SerialKind
 import kotlinx.serialization.descriptors.StructureKind
 import pw.binom.db.DatabaseEngine
+import pw.binom.db.LockStrategy
+import pw.binom.db.SqlDialect
 
 /**
  * Генератор SQL по [EntityDescription].
@@ -105,12 +107,37 @@ class SqlBuilder(private val dialect: Dialect) {
     }
 
     /** `SELECT ... WHERE id = :id` по первичному ключу. */
-    fun selectById(e: EntityDescription): String {
+    /**
+     * `SELECT ... WHERE id = :id`, с блокировкой по требованию.
+     *
+     * ## Почему стратегия, а не флаг
+     *
+     * В Postgres блокировка строки — это `FOR UPDATE` в конце запроса.
+     * В SQLite такого суффикса нет вовсе (`near "FOR": syntax error`), зато
+     * `BEGIN IMMEDIATE` блокирует запись на всю базу ещё до запроса.
+     *
+     * Поэтому `lock = true` означает «я хочу, чтобы строку нельзя было
+     * изменить параллельно», а **как** это сделано — решает драйвер. Иначе
+     * либо падало бы на SQLite, либо молча не блокировало в Postgres.
+     */
+    fun selectById(e: EntityDescription, lock: Boolean = false, dialect: SqlDialect? = null): String {
         require(e.idColumns.isNotEmpty()) { "selectById требует @Id у ${e.tableName}" }
         val where = e.idColumns.joinToString(" AND ") {
             "${ident(it.fullColumnName, it.quoted)} = :${it.propertyName}"
         }
-        return "${select(e)} WHERE $where"
+        val base = "${select(e)} WHERE $where"
+        if (!lock) return base
+        return when (dialect?.lockStrategy) {
+            // Суффикс: Postgres и подобные.
+            LockStrategy.ROW_LOCK -> "$base ${dialect.forUpdateClause()}"
+            // Блокировка уже взята транзакцией — суффикс не нужен и невалиден.
+            LockStrategy.TRANSACTION_LOCK -> base
+            // Ни стратегии, ни диалекта: молчать нельзя, иначе вызывающий
+            // получит ложную гарантию исключительности.
+            LockStrategy.NONE, null -> throw IllegalStateException(
+                "блокировка недоступна: ${dialect?.lockStrategy ?: "диалект не передан"}",
+            )
+        }
     }
 
     /** `UPDATE t SET a = :a WHERE id = :id`. */

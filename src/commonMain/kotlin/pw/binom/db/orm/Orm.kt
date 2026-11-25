@@ -105,11 +105,32 @@ class Orm private constructor(
         out
     }
 
-    /** Читает по первичному ключу. `null`, если строки нет. */
-    suspend fun <T : Any> findById(serializer: KSerializer<T>, id: Any?): T? = withConn { conn ->
+    /**
+     * Читает по первичному ключу. `null`, если строки нет.
+     *
+     * `lock = true` просит исключительности: строку нельзя изменить
+     * параллельно до конца транзакции. Как это делается — `FOR UPDATE` в
+     * Postgres, `BEGIN IMMEDIATE` в SQLite — решает драйвер через
+     * [pw.binom.db.DatabaseInfo.lockStrategy].
+     *
+     * **Требует открытой транзакции.** Вне её `FOR UPDATE` в Postgres
+     * блокировку сразу снимет (транзакция кончилась на первом же
+     * операторе), а `BEGIN IMMEDIATE` в SQLite вообще не сработает. Поэтому
+     * проверка здесь, а не надежда на сознательность вызывающего.
+     */
+    suspend fun <T : Any> findById(serializer: KSerializer<T>, id: Any?, lock: Boolean = false): T? = withConn { conn ->
         val e = description(serializer)
         require(e.idColumns.isNotEmpty()) { "у ${e.tableName} нет @Id" }
-        val stmt = conn.prepare(sql.selectById(e))
+        if (lock) {
+            // Вне транзакции блокировка бессмысленна: Postgres снимет её
+            // вместе с неявной транзакцией сразу после оператора, SQLite
+            // вообще не начнёт. Падать здесь честнее, чем отдать
+            // вызывающему ложную гарантию.
+            require(conn.isInTransaction) {
+                "lock = true требует открытой транзакции: оберните вызов в transaction { }"
+            }
+        }
+        val stmt = conn.prepare(sql.selectById(e, lock = lock, dialect = conn.dbInfo.dialect))
         stmt.use {
             val rs = it.query(listOf(sqlValueOf(id)))
             if (!rs.next()) return@withConn null
