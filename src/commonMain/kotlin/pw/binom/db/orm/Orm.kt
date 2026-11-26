@@ -295,6 +295,21 @@ class Orm private constructor(
      */
     suspend fun <R> transaction(block: suspend (Orm) -> R): R =
         withConn { conn ->
+            // Уже внутри транзакции — не открываем вторую.
+            //
+            // `conn.transaction` безусловно делает BEGIN: на Postgres вложенный
+            // BEGIN — молчаливый WARNING, и следующий COMMIT закрывает ВНЕШНЮЮ
+            // транзакцию; на SQLite — ошибка «cannot start a transaction within
+            // a transaction». Ни то, ни другое не является «вложенной
+            // транзакцией»: откат внешней не вернёт работу внутренней.
+            //
+            // Именно это ломало провижинер: `leaseCid` внутри общей
+            // транзакции создания машины открывал свою, коммитил аренду CID, а
+            // потом внешняя падала и откатывалась — аренда оставалась навсегда,
+            // а машины не было.
+            if (conn.isInTransaction) {
+                return@withConn block(Orm(null, conn, engine))
+            }
             conn.transaction { block(Orm(null, conn, engine)) }
         }
 
