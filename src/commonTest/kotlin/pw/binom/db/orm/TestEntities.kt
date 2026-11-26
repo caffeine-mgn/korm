@@ -73,3 +73,39 @@ data class ColorEntity(
     val id: Long,
     val color: Color,
 )
+
+/**
+ * Сущность с nullable-полями.
+ *
+ * Добавлена потому, что до неё ни одна тестовая сущность не имела полей
+ * `String?`/`Long?`, и контракт «`NULL` читается как `null`, а не как `""`»
+ * не был зафиксирован ничем. В провижинере от него зависит `agent_state`:
+ * колонка, прочитанная пустой строкой, означала бы на панели «связи не было».
+ */
+@Serializable
+@TableName("nullable_entities")
+data class NullableEntity(
+    @Id
+    val key: String,
+    var text: String? = null,
+    var number: Long? = null,
+)
+
+/**
+ * Nullable-поле БЕЗ значения по умолчанию.
+ *
+ * Разница принципиальна: kotlinx-serialization пропускает поля, равные
+ * значению по умолчанию, и `text: String? = null` при `null` не кодируется
+ * вовсе — ключа в карте нет, а ORM подставляет `SqlValue.Null` при выборке
+ * по колонкам. Второй класс проверяет, что явный `encodeNull` даёт ровно тот
+ * же `SqlValue.Null`: оба пути обязаны сходиться, иначе одна и та же сущность
+ * пишется по-разному в зависимости от того, задано ли поле.
+ */
+@Serializable
+@TableName("required_nullable_entities")
+data class RequiredNullableEntity(
+    @Id
+    val key: String,
+    val text: String?,
+    val number: Long?,
+)

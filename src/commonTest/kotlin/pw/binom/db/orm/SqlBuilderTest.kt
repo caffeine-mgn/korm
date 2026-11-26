@@ -207,4 +207,65 @@ class ValueEncoderTest {
         val m = ValueEncoder.encode(color, ColorEntity.serializer())
         assertEquals(SqlValue.Text("GREEN"), m["color"])
     }
+
+    @Test
+    fun `null-поля дают SqlValue Null`() {
+        // `agent_state` в провижинере — nullable TEXT, и `null` обязан уехать
+        // в базу именно NULL'ом. Пустая строка здесь была бы не «пусто», а
+        // наблюдением: читатель вернул бы её как факт, а не как отсутствие.
+        val m = ValueEncoder.encode(
+            NullableEntity(key = "k1", text = null, number = null),
+            NullableEntity.serializer(),
+        )
+
+        assertEquals(SqlValue.Null, m["text"], "null String? → SqlValue.Null: $m")
+        assertEquals(SqlValue.Null, m["number"], "null Long? → SqlValue.Null: $m")
+    }
+
+    @Test
+    fun `все колонки присутствуют в карте`() {
+        // Пропущенная колонка означает, что подстановка SqlValue.Null в
+        // valueOf() должна её закрыть. Если бы она этого не делала, значение
+        // в БД осталось бы старым — молчаливое расхождение с объектом.
+        val m = ValueEncoder.encode(
+            NullableEntity(key = "k3", text = null, number = null),
+            NullableEntity.serializer(),
+        )
+
+        for (col in listOf("key", "text", "number")) {
+            assertTrue(m.containsKey(col), "в карте нет колонки '$col': $m")
+        }
+    }
+
+    @Test
+    fun `пустая строка остаётся строкой, а не Null`() {
+        val m = ValueEncoder.encode(
+            NullableEntity(key = "k4", text = "", number = null),
+            NullableEntity.serializer(),
+        )
+
+        assertEquals(SqlValue.Text(""), m["text"], "'' не должна становиться Null: $m")
+    }
+
+    @Test
+    fun `nullable без default-значения тоже даёт Null`() {
+        // Разница с `null-поля дают SqlValue Null`: там у полей был `= null`,
+        // поэтому kotlinx их не кодирует вовсе. Здесь default нет, и значение
+        // идёт через encodeNull. Оба пути обязаны дать SqlValue.Null.
+        val m = ValueEncoder.encode(
+            RequiredNullableEntity(key = "r1", text = null, number = null),
+            RequiredNullableEntity.serializer(),
+        )
+
+        assertEquals(SqlValue.Null, m["text"] ?: SqlValue.Null, "text: $m")
+        assertEquals(SqlValue.Null, m["number"] ?: SqlValue.Null, "number: $m")
+    }
+
+    @Test
+    fun `nullable var-поле после установки значения видно`() {
+        val e = NullableEntity(key = "k9", text = null, number = null)
+        e.text = "connected"
+        val m = ValueEncoder.encode(e, NullableEntity.serializer())
+        assertEquals(SqlValue.Text("connected"), m["text"], "nullable var не виден: $m")
+    }
 }

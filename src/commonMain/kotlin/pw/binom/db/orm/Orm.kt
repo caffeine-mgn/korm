@@ -171,7 +171,13 @@ class Orm private constructor(
         }
     }
 
-    /** Обновляет по первичному ключу. */
+    /**
+     * Обновляет по первичному ключу всю строку.
+     *
+     * Писать нужно все колонки объекта — включая те, которых вызывающий
+     * не касался. Если у соседних колонок таблицы есть другой автор,
+     * предпочтите [update] с набором колонок: он не затирает чужое.
+     */
     suspend fun <T : Any> update(serializer: KSerializer<T>, value: T) {
         withConn { conn ->
             val e = description(serializer)
@@ -179,6 +185,40 @@ class Orm private constructor(
             stmt.use {
                 // Порядок: сначала SET-колонки, потом ключи в WHERE.
                 val sets = valuesOf(e, value, serializer, e.updateColumns)
+                val ids = e.idColumns.map { col -> valueOf(value, serializer, col) }
+                it.update(sets + ids)
+            }
+        }
+    }
+
+    /**
+     * Обновляет по первичному ключу только [columns].
+     *
+     * ## Отличие от полного [update]
+     *
+     * Полный `UPDATE` пишет строку целиком, то есть перезаписывает и чужие
+     * колонки — тем значения, с которыми объект был прочитан. В таблице,
+     * где у колонок разные авторы (машина пишет одно, наблюдатель — соседнюю),
+     * две параллельные read-modify-write записи теряет одна другую: каждая
+     * читает строку до записи другой, и последний коммит возвращает старой
+     * значение. Так в провижинере `agent_state` терял `connected`, хотя
+     * запись вернула `true`.
+     *
+     * Запись своих колонок гонку снимает: трогать чужое нечем, а свои колонки
+     * один автор пишет последовательно.
+     *
+     * Имена — [EntityDescription.updateColumnsOf]: имя свойства или имя
+     * колонки; ключ и сгенерированная колонка запрещены. Значение берётся из
+     * [value], поэтому объект достаточно прочитать целиком — менять нужно
+     * только свои поля.
+     */
+    suspend fun <T : Any> update(serializer: KSerializer<T>, value: T, columns: Collection<String>) {
+        val e = description(serializer)
+        val set = e.updateColumnsOf(columns)
+        withConn { conn ->
+            val stmt = conn.prepare(sql.update(e, set))
+            stmt.use {
+                val sets = valuesOf(e, value, serializer, set)
                 val ids = e.idColumns.map { col -> valueOf(value, serializer, col) }
                 it.update(sets + ids)
             }
