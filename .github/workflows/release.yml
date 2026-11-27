@@ -58,8 +58,17 @@ jobs:
       - name: Wait for kdatabase in Maven Central
         run: |
           set -euo pipefail
-          id="$(grep -E '^kdatabase[[:space:]]*=' gradle/libs.versions.toml \
-                | sed -E 's/.*"(.*)".*/\1/')"
+          # В libs.versions.toml ДВЕ строки начинаются с kdatabase:
+          #   kdatabase = "0.1.0"                       ← нужна эта
+          #   kdatabase = { module = "pw.binom.db:..." } ← и эта тоже подходит под ^kdatabase
+          # Без 'head -1' переменная становилась многострочной и URL ломался.
+          id="$(grep -E '^kdatabase[[:space:]]*=[[:space:]]*"' gradle/libs.versions.toml \
+                | head -1 | sed -E 's/.*"(.*)".*/\1/')"
+          if [ -z "$id" ]; then
+            echo "::error::не удалось определить версию kdatabase из libs.versions.toml"
+            exit 1
+          fi
+          echo "версия kdatabase: $id"
           url="https://repo1.maven.org/maven2/pw/binom/db/kdatabase/${id}/kdatabase-${id}.pom"
           echo "ожидаю $url"
           for attempt in $(seq 1 60); do
