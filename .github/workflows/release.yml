@@ -1,0 +1,125 @@
+# Публикация в Maven Central по тегу N.N.N (или N.N.N-suffix).
+#
+# Схема — как в serial-kmp, klmdb и kdatabase: ОДНА джоба на GitHub-hosted
+# macOS-раннере, все таргеты одним Sonatype-деплойментом.
+#
+# ⚠️ Порядок релизов в экосистеме:
+#     1. kdatabase  (ни от чего не зависит)
+#     2. korm       ← этот репозиторий (зависит от kdatabase)
+#     3. klmdb      (зависит от kdatabase и korm через свои адаптеры)
+#
+#   Перед тегом здесь pw.binom.db:kdatabase нужной версии ДОЛЖЕН уже лежать
+#   в Central, иначе публикация korm провалится на резолве зависимости.
+#
+# Почему без провижена jni_md.h: у этого модуля нет JNI и нативных библиотек —
+# только Kotlin-контракты, генератор SQL и кодеки.
+
+name: Release to Maven Central
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+
+env:
+  KONAN_VERSION: "2.4.21"
+
+jobs:
+  publish:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Verify nodejs for the JS target
+        run: |
+          node --version || { echo "::error::node не найден, JS-таргет не соберётся"; exit 1; }
+          echo "node: $(node --version)"
+
+      # Зависимость kdatabase должна резолвиться заранее: на раннере нет
+      # mavenLocal с соседним репозиторием, только Central.
+      - name: Assert kdatabase dependency is resolvable
+        run: |
+          ./gradlew --no-daemon :dependencies --configuration jvmCompileClasspath \
+            | grep -q "pw.binom.db:kdatabase" \
+            || { echo "::error::kdatabase не резолвится — опубликуйте её раньше korm"; exit 1; }
+          echo "kdatabase резолвится"
+
+      - name: Import GPG key
+        env:
+          GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSWORD }}
+        run: |
+          set -euo pipefail
+          command -v gpg >/dev/null 2>&1 || brew install gnupg
+          mkdir -p ~/.gnupg
+          chmod 700 ~/.gnupg
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          gpgconf --reload gpg-agent
+          if [ -n "$GPG_PASSPHRASE" ]; then
+            printf '%b' "$GPG_KEY" | gpg --batch --yes --pinentry-mode loopback \
+              --passphrase "$GPG_PASSPHRASE" --import
+          else
+            printf '%b' "$GPG_KEY" | gpg --batch --yes --pinentry-mode loopback --import
+          fi
+          gpg --list-secret-keys --with-colons | grep -q '^sec' && echo "GPG key imported"
+
+      - name: Run host tests (JVM + macOS native + JS)
+        run: |
+          ./gradlew --no-daemon --stacktrace \
+            jvmTest macosArm64Test jsNodeTest || {
+              echo "::warning::часть тестов не прошла, проверьте лог выше"
+              exit 1
+            }
+
+      - name: Assert tests actually ran
+        run: |
+          python3 - <<'PY'
+          import glob, re, sys
+          total = failures = 0
+          for f in glob.glob("**/build/test-results/*Test/*.xml", recursive=True):
+              text = open(f).read()
+              m = re.search(r'tests="(\d+)"[^>]*failures="(\d+)"[^>]*errors="(\d+)"', text)
+              if not m:
+                  continue
+              t, fl, er = map(int, m.groups())
+              total += t
+              failures += fl + er
+              print(f"{f}: tests={t} failures={fl} errors={er}")
+          print(f"ИТОГО тестов: {total}, провалов: {failures}")
+          if total == 0:
+              print("::error::Ни один тест не выполнился — прогон пустой")
+              sys.exit(1)
+          if failures:
+              print("::error::Есть проваленные тесты")
+              sys.exit(1)
+          PY
+
+      - name: Repository hygiene (no build outputs tracked)
+        run: test "$(git ls-files | grep -cE '^(build|\.gradle)/')" = "0"
+
+      - name: Publish all targets to Maven Central
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSWORD: ${{ secrets.GPG_PASSWORD }}
+        run: |
+          ./gradlew publishToMavenCentral --no-daemon --stacktrace \
+            -Pversion="${GITHUB_REF_NAME#v}" \
+            -PsigningUseGpg=true \
+            -Psigning.gnupg.keyName="$GPG_KEY_ID" \
+            -Psigning.gnupg.passphrase="$GPG_PASSWORD" \
+            -PmavenCentralUsername="${{ secrets.CENTRAL_USERNAME }}" \
+            -PmavenCentralPassword="${{ secrets.CENTRAL_PASSWORD }}"

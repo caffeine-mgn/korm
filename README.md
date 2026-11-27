@@ -37,6 +37,40 @@ SQLDelight — генератор кода из SQL, а не CRUD по объе�
 тянут за собой сессии, кэш первого уровня и unit of work. Для JOIN —
 `Orm.select` с готовым SQL.
 
+## Подключение
+
+Артефакт публикуется в Maven Central, релиз — по тегу `N.N.N`.
+
+```kotlin
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // ORM: CRUD по объектам поверх пула kdatabase.
+    implementation("pw.binom.db:korm:0.1.0")
+}
+```
+
+`korm` тянет `pw.binom.db:kdatabase` транзитивно (объявлена как `api`), поэтому
+отдельно её указывать не нужно — только если хотите зафиксировать версию.
+
+| Таргет | Артефакт |
+|---|---|
+| JVM | `pw.binom.db:korm-jvm` |
+| linuxX64 / linuxArm64 | `pw.binom.db:korm-linuxx64` / `-linuxarm64` |
+| macosX64 / macosArm64 | `pw.binom.db:korm-macosx64` / `-macosarm64` |
+| iOS | `pw.binom.db:korm-iosarm64` / `-iossimulatorarm64` |
+| mingwX64 | `pw.binom.db:korm-mingwx64` |
+| JS (browser / nodejs) | `pw.binom.db:korm-js` |
+
+**Драйвер нужен отдельно.** ORM строит SQL, но не исполняет его — под ней
+должен быть драйвер: `kpostgres`, `ksqlite` или LMDB-адаптер из
+[`caffeine-mgn/LMDB`](https://github.com/caffeine-mgn/LMDB).
+
+**Порядок релизов в экосистеме:** `kdatabase` → `korm` → `klmdb`. Перед тегом
+здесь версия `kdatabase` должна уже лежать в Central, иначе резолв упадёт.
+
 ## Проверка
 
 ```

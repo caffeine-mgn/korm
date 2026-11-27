@@ -10,6 +10,8 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositories {
+        // mavenCentral — основной источник на чистом раннере CI.
+        mavenCentral()
         // mavenLocal первым: kdatabase публикуется локально до выхода в Central,
         // и соседние репозитории должны видеть свежую версию сразу.
         mavenLocal()
