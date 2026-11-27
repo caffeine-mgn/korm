@@ -71,6 +71,22 @@ dependencies {
 **Порядок релизов в экосистеме:** `kdatabase` → `korm` → `klmdb`. Перед тегом
 здесь версия `kdatabase` должна уже лежать в Central, иначе резолв упадёт.
 
+## Релиз
+
+Публикация — GitHub Actions на `macos-latest`, триггер `git tag 0.1.0 && git
+push --tags`. Тег становится версией артефакта.
+
+**Порядок: `kdatabase` → `korm` → `klmdb`.** Перед тегом здесь версия
+`pw.binom.db:kdatabase` должна уже лежать в Maven Central, иначе сборка упадёт
+на резолве зависимости. Workflow проверяет это отдельным шагом и говорит прямо.
+
+Секреты репозитория: `GPG_PRIVATE_KEY`, `GPG_PASSWORD`, `GPG_KEY_ID`,
+`CENTRAL_USERNAME`, `CENTRAL_PASSWORD`.
+
+Версия kdatabase фиксируется в `gradle/libs.versions.toml` (`kdatabase = "..."`)
+— поднимайте её вместе с тегом, иначе опубликуете korm против старой
+зависимости.
+
 ## Проверка
 
 ```
