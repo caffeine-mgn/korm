@@ -238,7 +238,7 @@ class ValueEncoderTest {
     }
 
     @Test
-    fun `пустая строка остаётся строкой, а не Null`() {
+    fun `пустая строка остаётся строкой а не Null`() {
         val m = ValueEncoder.encode(
             NullableEntity(key = "k4", text = "", number = null),
             NullableEntity.serializer(),
