@@ -50,12 +50,30 @@ jobs:
 
       # Зависимость kdatabase должна резолвиться заранее: на раннере нет
       # mavenLocal с соседним репозиторием, только Central.
-      - name: Assert kdatabase dependency is resolvable
+      #
+      # Central неизменяем и асинхронен: деплой kdatabase проходит состояние
+      # PUBLISHING ~15-25 минут, и только потом появляется в repo1.maven.org.
+      # Если запустить korm сразу после kdatabase, резолв упадёт на 404 —
+      # проверено на практике (прогон #1). Поэтому ждём появления POM.
+      - name: Wait for kdatabase in Maven Central
         run: |
-          ./gradlew --no-daemon :dependencies --configuration jvmCompileClasspath \
-            | grep -q "pw.binom.db:kdatabase" \
-            || { echo "::error::kdatabase не резолвится — опубликуйте её раньше korm"; exit 1; }
-          echo "kdatabase резолвится"
+          set -euo pipefail
+          id="$(grep -E '^kdatabase[[:space:]]*=' gradle/libs.versions.toml \
+                | sed -E 's/.*"(.*)".*/\1/')"
+          url="https://repo1.maven.org/maven2/pw/binom/db/kdatabase/${id}/kdatabase-${id}.pom"
+          echo "ожидаю $url"
+          for attempt in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "kdatabase ${id} доступна (попытка $attempt)"
+              exit 0
+            fi
+            echo "попытка $attempt: HTTP $code, пауза 30 с"
+            sleep 30
+          done
+          echo "::error::kdatabase ${id} не появилась в Central за 30 минут"
+          echo "Проверьте статус: central.sonatype.com → Deployments"
+          exit 1
 
       - name: Import GPG key
         env:
